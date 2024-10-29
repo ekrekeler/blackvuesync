@@ -20,7 +20,6 @@ __version__ = "1.9a"
 import argparse
 import datetime
 from collections import namedtuple
-import fcntl
 import glob
 import http.client
 import logging
@@ -673,21 +672,26 @@ def lock(destination):
     umask_original = os.umask(0)
 
     try:
+        import fcntl
         lf_fd = os.open(lf_path, lf_flags, lf_mode)
-    finally:
         os.umask(umask_original)
-
-    try:
         fcntl.lockf(lf_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
         return lf_fd
+    except ImportError:
+        # File locking not supported on Windows
+        pass
     except IOError:
         raise UserWarning("Another instance is already running for destination : %s" % destination)
 
 
 def unlock(lf_fd):
     """unlocks the lock file; does not remove because another process may lock it in the meantime"""
-    fcntl.lockf(lf_fd, fcntl.LOCK_UN)
+    try:
+        import fcntl
+        fcntl.lockf(lf_fd, fcntl.LOCK_UN)
+    except ImportError:
+        # File locking not supported on Windows
+        pass
 
 
 def parse_args():
