@@ -33,6 +33,66 @@ import urllib
 import urllib.parse
 import urllib.request
 import socket
+from html.parser import HTMLParser
+
+
+class VIOFOParser(HTMLParser):
+    # Parser for HTML response from VIOFO cameras
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._filelist = None
+        self._dirlist = None
+        self._lasttag = None
+        self._filename_next = False
+
+    def feed(self, data):
+        self._filelist = []
+        self._dirlist = []
+        super().feed(data)
+
+    def reset(self):
+        super().reset()
+        self._filelist = None
+        self._dirlist = None
+        self._lasttag = None
+        self._filename_next = False
+
+    def handle_starttag(self, tag, attrs):
+        # Runs every time the parser encounters a start tag
+        if tag == "td" and self._lasttag == "tr":
+            self._filename_next = True
+        elif tag == "a" and self._filename_next:
+            for attr, value in attrs:
+                if attr == "href":
+                    # Found a filepath or directory path
+                    self._filelist.append(value)
+                    self._filename_next = False
+
+        # lasttag attribute is already updated when this funtion is called, so we set our own attribute
+        if tag != "i":
+            self._lasttag = tag
+
+    def handle_data(self, data):
+        # Runs for every text node found
+        if self.lasttag == "i" and self._lasttag == "td" and data == "folder" and not self._filename_next:
+            # The last href added to the list is a directory
+            # We can remove it and add it to a separate list for recursion later
+            dirname = self._filelist.pop(-1)
+            self._dirlist.append(dirname)
+
+    def handle_endtag(self, tag):
+        # Runs every time the parser enounters an end tag
+        if tag == "tr":
+            # Unnecessary, just here to avoid capturing data outside table rows
+            self._filename_next = False
+
+    def get_filenames(self):
+        return self._filelist
+
+    def get_directories(self):
+        return self._dirlist
+
 
 # logging
 logging.basicConfig(format="%(asctime)s: %(levelname)s %(message)s")
@@ -104,7 +164,7 @@ def calc_cutoff_date(keep):
 
 
 # represents a recording from the dashcam; the dashcam serves the list of video recording filenames (front and rear)
-Recording = namedtuple("Recording", "filename base_filename group_name datetime type direction")
+Recording = namedtuple("Recording", "filename directory base_filename group_name datetime type direction")
 
 # dashcam recording filename regular expression
 #
@@ -125,16 +185,35 @@ Recording = namedtuple("Recording", "filename base_filename group_name datetime 
 # G: Geofence-pass
 #
 # L or S: upload flag, Substream or Live
-filename_re = re.compile(r"""(?P<base_filename>(?P<year>\d\d\d\d)(?P<month>\d\d)(?P<day>\d\d)
-    _(?P<hour>\d\d)(?P<minute>\d\d)(?P<second>\d\d))
+blackvue_filename_re = re.compile(r"""
+    (?P<base_filename>(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})
+    _(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2}))
     _(?P<type>[NEPMIOATBRXG])
     (?P<direction>[FRI])
     (?P<upload>[LS]?)
     \.(?P<extension>mp4)""", re.VERBOSE)
 
+# VIOFO dashcam filenames have only (P)arking event type, and recordings are saved to various directories for different event types.
+# Reference: https://support.viofo.com/support/solutions/articles/19000140330-a139-pro-car-dash-camera-manual
+viofo_filename_re = re.compile(r"""
+    (?P<directory>/DCIM/(\w+/)+)
+    (?P<base_filename>(?P<year>\d{4})_(?P<month>\d{2})(?P<day>\d{2})
+    _(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2}))
+    _(?P<type>P?)
+    (?P<direction>[FRI])
+    \.(?P<extension>MP4)""", re.VERBOSE)
+viofo_directory_types = {
+    "/DCIM/Movie/": "N",
+    "/DCIM/Movie/RO/": "M",
+    "/DCIM/Movie/Parking/": "P",
+}
 
-def to_recording(filename, grouping):
+def to_recording(filename, grouping, camera_type):
     """extracts recording information from a filename"""
+    filename_re = blackvue_filename_re
+    directory = "/Record/"
+    if camera_type == "viofo":
+        filename_re = viofo_filename_re
     filename_match = re.fullmatch(filename_re, filename)
 
     if filename_match is None:
@@ -151,10 +230,17 @@ def to_recording(filename, grouping):
     recording_base_filename = filename_match.group("base_filename")
     recording_group_name = get_group_name(recording_datetime, grouping)
     recording_type = filename_match.group("type")
+    if camera_type == "viofo":
+        directory = filename_match.group("directory")
+        # Strip directory from the filename
+        filename = filename.replace(directory, "")
+        if not recording_type:
+            # We can manually set recording type for VIOFO recordings based on directory location
+            recording_type = viofo_directory_types[directory]
     recording_direction = filename_match.group("direction")
 
-    return Recording(filename, recording_base_filename, recording_group_name, recording_datetime, recording_type,
-                     recording_direction)
+    return Recording(filename, directory, recording_base_filename, recording_group_name, recording_datetime,
+                     recording_type, recording_direction)
 
 
 # pattern of a recording filename as returned in each line from from the dashcam index page
@@ -173,21 +259,15 @@ def get_filenames(file_lines):
     return filenames
 
 
-def get_dashcam_filenames(base_url):
+def get_dashcam_filenames(base_url, camera_type="blackvue", list_endpoint=None):
     """gets the recording filenames from the dashcam"""
+    if not list_endpoint:
+        list_endpoint = "DCIM/" if camera_type == "viofo" else "blackvue_vod.cgi"
     try:
-        url = urllib.parse.urljoin(base_url, "blackvue_vod.cgi")
+        url = urllib.parse.urljoin(base_url, list_endpoint)
         request = urllib.request.Request(url)
         response = urllib.request.urlopen(request)
 
-        response_status_code = response.getcode()
-        if response_status_code != 200:
-            raise RuntimeError("Error response from : %s ; status code : %s" % (base_url, response_status_code))
-
-        charset = response.info().get_param("charset", "UTF-8")
-        file_lines = [x.decode(charset) for x in response.readlines()]
-
-        return get_filenames(file_lines)
     except urllib.error.URLError as e:
         raise RuntimeError("Cannot obtain list of recordings from dashcam at address : %s; error : %s"
                            % (base_url, e))
@@ -195,6 +275,36 @@ def get_dashcam_filenames(base_url):
         raise UserWarning("Timeout communicating with dashcam at address : %s; error : %s" % (base_url, e))
     except http.client.RemoteDisconnected as e:
         raise UserWarning("Dashcam disconnected without a response; address : %s; error : %s" % (base_url, e))
+
+    response_status_code = response.getcode()
+    if response_status_code != 200:
+        raise RuntimeError("Error response from : %s ; status code : %s" % (base_url, response_status_code))
+
+    charset = response.info().get_content_charset("utf-8")
+    # Some additional headers for debugging
+    #content_type = response.info().get_content_type()
+    #server = response.getheader("Server")
+
+    # Text parser for BlackVue, HTML parser for VIOFO
+    if camera_type == "viofo":
+        parser = VIOFOParser()
+        parser.feed(response.read().decode(charset))
+
+        filenames = parser.get_filenames()
+        # Recurse through directories until there are none left
+        #NOTE this will be a problem if it is ever used on directory listings that link back the the parent directory, e.g. ".."
+        for new_endpoint in parser.get_directories():
+            try:
+                filenames += get_dashcam_filenames(base_url, camera_type, new_endpoint)
+            except RuntimeError:
+                # If request returns HTTP 404 response, we can safely ignore it
+                pass
+        return filenames
+    
+    else:
+        file_lines = [x.decode(charset) for x in response.readlines()]
+
+        return get_filenames(file_lines)
 
 
 def get_group_name(recording_datetime, grouping):
@@ -239,13 +349,13 @@ def get_filepath(destination, group_name, filename):
         return os.path.join(destination, filename)
 
 
-def download_file(base_url, filename, destination, group_name):
+def download_file(base_url, path, filename, destination, group_name):
     """downloads a file from the dashcam to the destination directory; returns whether data was transferred"""
     # if we have a group name, we may not have ensured it exists yet
     if group_name:
         group_filepath = os.path.join(destination, group_name)
         ensure_destination(group_filepath)
-
+    
     destination_filepath = get_filepath(destination, group_name, filename)
 
     if os.path.exists(destination_filepath):
@@ -261,7 +371,7 @@ def download_file(base_url, filename, destination, group_name):
         return True, None
 
     try:
-        url = urllib.parse.urljoin(base_url, "Record/%s" % filename)
+        url = urllib.parse.urljoin(base_url, "%s%s" % (path, filename))
 
         start = time.perf_counter()
         try:
@@ -302,22 +412,23 @@ def download_recording(base_url, recording, destination):
 
     # downloads the video recording
     filename = recording.filename
-    downloaded, speed_bps = download_file(base_url, filename, destination, recording.group_name)
+    path = recording.directory
+    downloaded, speed_bps = download_file(base_url, path, filename, destination, recording.group_name)
     any_downloaded |= downloaded
 
     # downloads the thumbnail file
     thm_filename = "%s_%s%s.thm" % (recording.base_filename, recording.type, recording.direction)
-    downloaded, _ = download_file(base_url, thm_filename, destination, recording.group_name)
+    downloaded, _ = download_file(base_url, path, thm_filename, destination, recording.group_name)
     any_downloaded |= downloaded
 
     # downloads the accelerometer data
     tgf_filename = "%s_%s.3gf" % (recording.base_filename, recording.type)
-    downloaded, _ = download_file(base_url, tgf_filename, destination, recording.group_name)
+    downloaded, _ = download_file(base_url, path, tgf_filename, destination, recording.group_name)
     any_downloaded |= downloaded
 
     # downloads the gps data for normal, event and manual recordings
     gps_filename = "%s_%s.gps" % (recording.base_filename, recording.type)
-    downloaded, _ = download_file(base_url, gps_filename, destination, recording.group_name)
+    downloaded, _ = download_file(base_url, path, gps_filename, destination, recording.group_name)
     any_downloaded |= downloaded
 
     # logs if any part of a recording was downloaded (or would have been)
@@ -442,8 +553,13 @@ def get_current_recordings(recordings):
 
 def get_filtered_recordings(recordings, recording_filter):
     """returns recordings filtered by recording_filter """
-    return recordings if recording_filter is None else [x for x in recordings
-                                                        if "%s%s" % (x.type, x.direction) in recording_filter]
+    if recording_filter is None:
+        return recordings
+
+    filtered_recordings = []
+    for rec_filter in recording_filter:
+        filtered_recordings += [x for x in recordings if rec_filter in "%s%s" % (x.type, x.direction)]
+    return filtered_recordings
 
 
 def ensure_destination(destination):
@@ -484,24 +600,24 @@ def prepare_destination(destination, grouping):
                 os.remove(outdated_filepath)
 
 
-def sync(address, destination, grouping, download_priority, recording_filter):
+def sync(address, destination, grouping, download_priority, recording_filter, camera_type):
     """synchronizes the recordings at the dashcam address with the destination directory"""
     prepare_destination(destination, grouping)
 
     base_url = "http://%s" % address
-    dashcam_filenames = get_dashcam_filenames(base_url)
-    dashcam_recordings = [to_recording(x, grouping) for x in dashcam_filenames]
+    dashcam_filenames = get_dashcam_filenames(base_url, camera_type)
+    dashcam_recordings = [to_recording(x, grouping, camera_type) for x in dashcam_filenames]
 
     # figures out which recordings are current and should be downloaded
     current_dashcam_recordings = get_current_recordings(dashcam_recordings)
 
     # filter recordings according to recording_filter tuple
-    current_dashcam_recordings = get_filtered_recordings(current_dashcam_recordings, recording_filter)
+    filtered_dashcam_recordings = get_filtered_recordings(current_dashcam_recordings, recording_filter)
 
     # sorts the dashcam recordings so we download them according to some priority
-    sort_recordings(current_dashcam_recordings, download_priority)
+    sort_recordings(filtered_dashcam_recordings, download_priority)
 
-    for recording in current_dashcam_recordings:
+    for recording in filtered_dashcam_recordings:
         download_recording(base_url, recording, destination)
 
 
@@ -606,6 +722,9 @@ def parse_args():
     arg_parser.add_argument("-t", "--timeout", metavar="TIMEOUT", default=10.,
                             type=float,
                             help="sets the connection timeout in seconds (float); defaults to 10.0 seconds")
+    arg_parser.add_argument("-c", "--camera-type", metavar="CAM_TYPE", default="blackvue",
+                            choices=["blackvue", "viofo"],
+                            help="Specify the camera type. Defaults to blackvue")
     arg_parser.add_argument("-v", "--verbose", action="count", default=0,
                             help="increases verbosity")
     arg_parser.add_argument("-q", "--quiet", action="store_true",
@@ -662,7 +781,7 @@ def run():
         lf_fd = lock(destination)
 
         try:
-            sync(args.address, destination, grouping, args.priority, args.filter)
+            sync(args.address, destination, grouping, args.priority, args.filter, args.camera_type)
         finally:
             # removes temporary files (if we synced successfully, these are temp files from lost recordings)
             clean_destination(destination, grouping)
